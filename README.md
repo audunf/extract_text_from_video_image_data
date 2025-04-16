@@ -64,3 +64,7 @@ Steps:
 - Press ```s``` to save the ROIs to ```roi_config.json```
 - Press SPACE again to resume decoding
 - Let the video run until the end and look at all the results.
+
+# Screenshot
+Colored rectangles are ROIs. Images with large timestamps in black and white are  these regions after pre-processing - prior to OCR.
+![Screenshot of app in use](images/screenshot.png)
