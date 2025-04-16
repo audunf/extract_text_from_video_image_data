@@ -1,6 +1,8 @@
 # What is this?
 This is a small tool for extracting text from pre-defined regions in video files. More specifically - timestamps. Although, it's easy to change what it "prefers" (just change the regular expressions in ```post_process_text``` ).
 
+What makes it a bit different? It is pretty good at recognizing text which is skewed and rotated at different angles - not just horizontal or vertical. Also, it works pretty well with weird reflections and lighting conditions (although YMMW - never tested anything too crazy).
+
 The user defines regions to examine in the video. It is assumed that the camera is standing still, and the text changes per frame.
 For each region, the program attempts different transformations and enhancements - selecting the ones which give the highest OCR confidence level.
 Then Paddle OCR is used to extract the text. The recognized text is displayed, and also saves to a CSV output file together with the timestamp from the video file.
@@ -63,7 +65,8 @@ Example:
 
 This will analyze the AVI file, dump results in results.csv, and take a sample every second of the video.
 
-When first started, the user must point out where the text is located. This is called defining "regions of interest" (ROIs).
+When first started, the user must point out where the text is located in the image from the video. This is called defining "regions of interest" (ROIs).
+It's essentially a bounding box for the text to perform OCR on.
 Without these regions, the program won't do anything.
 
 Steps:
