@@ -13,10 +13,9 @@ Make sure you understand the dependencies, their size and other requirements bef
 
 Not tested on Windows, only Linux (PopOS/Ubuntu 22.04)
 
+Please note that this is a quick and dirty implementation thrown together in an evening to see whether it was easy/possible to make it work. The code is not "maintained" as such.
+
 # About
-- Author: Audun Føyen
-- Email: audun@audunfoyen.com
-- Copyright (c) 2025 Audun Føyen
 - License: MIT
 
 With help from various LLMs.
