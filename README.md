@@ -1,3 +1,13 @@
+# What is this?
+This is a small tool for extracting text from pre-defined regions in video files.
+The specific case this has been tuned for is looking for timestamps in some special video files.
+The user must define the regions to examine in the video. It is assumed that the camera is standing still, and the text changes per frame.
+This tool does some transformations on the regions and image data, then uses Paddle OCR to extract the text.
+
+Make sure you understand the dependencies, their size and other requirements before attempting to use this. It is a small script, but it has some rather large and heavy dependencies.
+
+Not tested on Windows, only Linux (PopOS/Ubuntu 22.04)
+
 # About
 - Author: Audun Føyen
 - Email: audun@audunfoyen.com
