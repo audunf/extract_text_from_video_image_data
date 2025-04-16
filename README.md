@@ -1,17 +1,14 @@
 # About
-Author: Audun Føyen
-Email: audun@audunfoyen.com
-Copyright (c) 2025 Audun Føyen
-License: MIT
+- Author: Audun Føyen
+- Email: audun@audunfoyen.com
+- Copyright (c) 2025 Audun Føyen
+- License: MIT
 
 With help from various LLMs.
 
 # System
-Tested on PopOS (essentially Ubuntu):
-Distributor ID:	Pop
-Description:	Pop!_OS 22.04 LTS
-Release:	22.04
-Codename:	jammy
+- Tested on PopOS (essentially Ubuntu):
+- Description:	Pop!_OS 22.04 LTS
 
 # Install
 The requirements are relatively heavy. Make sure you have enough disk space and time for the download from Tsinghua University in China (it's slow).
