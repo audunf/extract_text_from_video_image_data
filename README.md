@@ -1,8 +1,11 @@
 # What is this?
-This is a small tool for extracting text from pre-defined regions in video files.
-The specific case this has been tuned for is looking for timestamps in some special video files.
-The user must define the regions to examine in the video. It is assumed that the camera is standing still, and the text changes per frame.
-This tool does some transformations on the regions and image data, then uses Paddle OCR to extract the text.
+This is a small tool for extracting text from pre-defined regions in video files. More specifically - timestamps. Although, it's easy to change what it "prefers" (just change the regular expressions in ```post_process_text``` ).
+
+The user defines regions to examine in the video. It is assumed that the camera is standing still, and the text changes per frame.
+For each region, the program attempts different transformations and enhancements - selecting the ones which give the highest OCR confidence level.
+Then Paddle OCR is used to extract the text. The recognized text is displayed, and also saves to a CSV output file together with the timestamp from the video file.
+
+One of the parameters is how often it should sample the video. For example, only every 10 seconds.
 
 Make sure you understand the dependencies, their size and other requirements before attempting to use this. It is a small script, but it has some rather large and heavy dependencies.
 
