@@ -1,8 +1,3 @@
-# Author: Audun Føyen <audun@audunfoyen.com>
-# Copyright (c) 2025 Audun Føyen
-# License: MIT
-
-
 # Import necessary libraries
 import cv2
 import paddleocr
@@ -10,23 +5,23 @@ import sys
 import os
 import csv
 import re
-import pandas as pd # Keep pandas import for potential future use, though not used now
+# import pandas as pd # No longer needed
 from datetime import timedelta
 import time
 import numpy as np
 import json # For loading/saving ROIs
 import math
-
+import glob # For handling file paths and patterns
+import traceback # Import traceback module
+import argparse # For robust argument parsing
 
 # --- Configuration ---
 ROI_CONFIG_FILE = 'roi_config.json'
-# Define a TARGET width for the straightened ROI patches. Height will be calculated.
-ROI_TARGET_WIDTH = 300 # Adjust as needed
-
+ROI_TARGET_WIDTH = 300 # Target width for straightened patches
 # --- >>> GUI Toggle <<< ---
-ENABLE_DISPLAY = True
+# ENABLE_DISPLAY = True # Controlled by command-line arg now
 # --- >>> CPU/GPU Toggle <<< ---
-FORCE_CPU = False
+# FORCE_CPU = False # Controlled by command-line arg now
 # --- >>> Preprocessing Flags (Applied BEFORE ROI Warp) <<< ---
 ROTATE_FRAME_90_CW = False
 ROTATE_FRAME_90_CCW = False
@@ -44,14 +39,13 @@ PADDLE_DB_THRESH = 0.3
 # --- >>> Optimization Parameters <<< ---
 NORMAL_ORIENTATION_CONF_THRESHOLD = 0.85
 
-
 # --- Global Variables for Interaction ---
 rois = [] # List of ROI dicts
 next_roi_id = 0
 current_roi_points = []
 defining_roi = False
 paused = False
-show_warped = False # Flag to control warped ROI display
+show_warped = False
 
 # Define colors for ROI bounding boxes
 ROI_COLORS = [
@@ -62,6 +56,11 @@ ROI_COLORS = [
 ]
 
 # --- Helper Functions ---
+# format_timedelta, load_rois, save_rois, apply_roi_transform,
+# calculate_avg_confidence, estimate_roi_dims, calculate_roi_angle,
+# get_closest_rotation, enhance_roi_patch, post_process_text,
+# optimize_roi_transform, mouse_callback
+# (These functions remain the same as the previous version)
 
 def format_timedelta(td):
     """Formats a timedelta object into a HH:MM:SS.fff string."""
@@ -140,7 +139,9 @@ def estimate_roi_dims(roi_points):
         dist_01 = np.linalg.norm(pts[0] - pts[1]); dist_12 = np.linalg.norm(pts[1] - pts[2])
         dist_23 = np.linalg.norm(pts[2] - pts[3]); dist_30 = np.linalg.norm(pts[3] - pts[0])
         est_width = (dist_01 + dist_23) / 2.0; est_height = (dist_12 + dist_30) / 2.0
-        if est_width < 1 or est_height < 1: return ROI_TARGET_WIDTH, 50 # Default aspect ratio
+        if est_width < 1e-6 or est_height < 1e-6: # Use a small epsilon instead of just 1
+             print(f"Warning: Degenerate ROI points detected (width or height near zero): {roi_points}. Using default dims.")
+             return ROI_TARGET_WIDTH, 50 # Return a default aspect ratio
         return est_width, est_height
     except Exception as e: print(f"W: Could not estimate ROI dims: {e}"); return ROI_TARGET_WIDTH, 50
 
@@ -204,8 +205,11 @@ def optimize_roi_transform(roi_index, frame, ocr_engine):
     best_transform = {'rotate': target_rotation, 'flip_code': None}
     try:
         est_w, est_h = estimate_roi_dims(roi_points);
-        if est_w < 1: est_w = 1
-        target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
+        if est_w < 1e-6:
+             print(f"  Warning: Estimated width for ROI #{roi_id} is near zero. Using default aspect ratio for warp.")
+             target_h = 50
+        else:
+             target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
         roi_dst_points_opt = np.float32([[0, 0], [ROI_TARGET_WIDTH - 1, 0], [ROI_TARGET_WIDTH - 1, target_h - 1], [0, target_h - 1]])
         roi_src_points = np.float32(roi_points)
         matrix = cv2.getPerspectiveTransform(roi_src_points, roi_dst_points_opt)
@@ -262,8 +266,10 @@ def mouse_callback(event, x, y, flags, param):
     global current_roi_points, defining_roi, rois, next_roi_id, frame_for_opt
     if not defining_roi: return
     if event == cv2.EVENT_LBUTTONDOWN:
-        if x < 0: x = 0
-        if y < 0: y = 0
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
         if len(current_roi_points) < 4:
             current_roi_points.append([x, y])
             print(f"ROI point {len(current_roi_points)} added: ({x}, {y})")
@@ -279,211 +285,97 @@ def mouse_callback(event, x, y, flags, param):
                 print(f"ROI #{current_roi_id} optimization done. Press 'n' for new ROI, 'd' to delete last, 's' to save.")
 
 
-# --- Main Processing Logic ---
+# --- Main Processing Function ---
 frame_for_opt = None # Global to hold frame for optimization callback
 
-def process_video(video_path, output_csv_path, sample_interval_sec=1.0, display_enabled=True):
+def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1.0, display_enabled=True):
     """
-    Main function modified for time-based sampling.
+    Processes a single video file with time-based sampling and frame skipping display.
+    Handles ROI processing, OCR, display, and CSV writing.
+    Returns True if successful, False otherwise.
     """
     global rois, current_roi_points, defining_roi, paused, next_roi_id, frame_for_opt, show_warped
 
-    # --- Initialize PaddleOCR ---
-    print("Initializing PaddleOCR (attempting GPU)...")
-    try:
-        ocr_engine = paddleocr.PaddleOCR(
-            use_angle_cls=True, lang='en', use_gpu=(not FORCE_CPU), show_log=False,
-            det_db_unclip_ratio=PADDLE_UNCLIP_RATIO,
-            det_db_thresh=PADDLE_DB_THRESH,
-            det_db_box_thresh=PADDLE_BOX_THRESH
-        )
-        print("PaddleOCR initialized.");
-        print(f"  Using Params: UnclipRatio={PADDLE_UNCLIP_RATIO}, DBThresh={PADDLE_DB_THRESH}, BoxThresh={PADDLE_BOX_THRESH}")
-        if FORCE_CPU: print("PaddleOCR running on CPU (forced).")
-        else: print("PaddleOCR attempting GPU.")
-    except Exception as e: print(f"Error initializing PaddleOCR: {e}"); raise ImportError("Failed PaddleOCR init.") from e
+    print(f"\n===== Processing Video: {video_path} =====")
+    base_filename = os.path.basename(video_path)
 
     # --- Video Loading ---
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened(): raise IOError(f"Error: Could not open video file '{video_path}'.")
+    if not cap.isOpened():
+        print(f"Error: Could not open video file '{video_path}'. Skipping.")
+        return False
 
-    # --- Get Video Properties & Read First Frame ---
+    # --- Get Video Properties ---
     fps = cap.get(cv2.CAP_PROP_FPS); total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_duration_sec = (total_frames / fps) if fps and fps > 0 else 0
 
-    # --- FPS Check for Time-Based Sampling ---
+    # --- FPS Check ---
     if fps <= 0:
-        print(f"Error: Video FPS is {fps}. Cannot use time-based sampling.")
+        print(f"Error: Video FPS is {fps} for {video_path}. Cannot process. Skipping.")
         cap.release()
-        return # Exit if FPS is invalid
+        return False
 
-    print(f"Video loaded: '{os.path.basename(video_path)}'")
-    print(f"Resolution: {frame_width}x{frame_height}, Total Frames: {total_frames}, FPS: {fps:.2f}")
-    if total_duration_sec > 0: print(f"Estimated Duration: {timedelta(seconds=total_duration_sec)}")
-    else: print("Could not determine video duration.")
-    print(f"OCR Sampling Interval: {sample_interval_sec} seconds")
+    print(f"  Resolution: {frame_width}x{frame_height}, Total Frames: {total_frames}, FPS: {fps:.2f}")
+    if total_duration_sec > 0: print(f"  Estimated Duration: {timedelta(seconds=total_duration_sec)}")
+    print(f"  OCR Sampling Interval: {sample_interval_sec} seconds")
 
 
+    # --- Read First Frame (needed for potential optimization) ---
     ret, first_frame = cap.read()
-    if not ret: print("Error: Could not read the first frame."); cap.release(); return
-    frame_for_opt = first_frame
+    if not ret: print("Error: Could not read the first frame."); cap.release(); return False
+    frame_for_opt = first_frame # Make available globally
 
-    # --- Load Initial ROIs & Optimize Them ---
-    rois_loaded = load_rois(ROI_CONFIG_FILE)
-    if rois_loaded and rois:
-        print("Optimizing transforms for loaded ROIs...")
-        for i in range(len(rois)): optimize_roi_transform(i, first_frame, ocr_engine)
-        print("Finished optimizing loaded ROIs.")
+    # --- Optimize ROIs if needed (only if loaded, new ones optimized on creation) ---
+    # Optimization now happens on load or when new ROI is defined.
+    # Re-optimization can be triggered with 'o' key.
 
     # --- Setup OpenCV Window and Mouse Callback (if display enabled) ---
-    window_name = "ROI Definition & OCR Output"
+    window_name = f"ROI Definition & OCR Output - {base_filename}"
     if display_enabled:
         cv2.namedWindow(window_name)
         frame_ref = [first_frame]
         cv2.setMouseCallback(window_name, mouse_callback, param=(ocr_engine, frame_ref))
-        # Print controls
-        print("\n--- Controls ---")
-        print(" Mouse Click: Define ROI corners (after pressing 'n')")
-        print("  n: Start NEW ROI | d: DELETE last | c: CLEAR all")
-        print("  s: SAVE ROIs | l: LOAD ROIs | o: Re-OPTIMIZE all ROIs")
-        print("  v: Toggle VIEW warped/optimized patches (when PAUSED)")
-        print("  SPACE: PAUSE / RESUME | q: QUIT")
-        print("----------------")
-    else: print("Display window disabled.")
-
-    # --- Setup CSV File for Incremental Writing ---
-    csv_headers = ['Video Time', 'Frame', 'ROI ID', 'Recognized Text']
-    file_exists = os.path.exists(output_csv_path)
-    try:
-        csvfile = open(output_csv_path, 'a', newline='', encoding='utf-8')
-        csv_writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
-        if not file_exists or os.path.getsize(output_csv_path) == 0:
-            csv_writer.writerow(csv_headers)
-            print(f"Writing new CSV file: {output_csv_path}")
-        else: print(f"Appending to existing CSV file: {output_csv_path}")
-    except IOError as e: print(f"Error opening CSV file {output_csv_path}: {e}"); cap.release(); return
-
-    # --- Processing Loop ---
-    frame_number = 0; processed_frame_count = 0; total_ocr_time = 0
-    current_frame = first_frame
-    last_processed_time_sec = -sample_interval_sec # Ensure first frame is processed
-    # Removed redundant roi_dst_points definition here
-
-    try: # Wrap main loop for finally block to close CSV
-        while True:
-            # --- Read Frame ---
-            if not paused:
-                ret, frame = cap.read();
-                if not ret: break
-                current_frame = frame
-                if display_enabled: frame_ref[0] = current_frame
-            if current_frame is None: break # Should not happen
-
-            # --- Prepare Display Frame ---
-            display_frame = current_frame.copy()
-            current_video_time_sec = frame_number / fps
-
-            # --- Determine if OCR should run this iteration ---
-            should_process_ocr = not paused and (current_video_time_sec - last_processed_time_sec >= sample_interval_sec)
-
-            if should_process_ocr:
-                processed_frame_count += 1 # Count OCR processing attempts
-                last_processed_time_sec = current_video_time_sec # Update time of last processing
-                video_timestamp_str = format_timedelta(timedelta(seconds=current_video_time_sec))
-                progress_percent = (frame_number / total_frames * 100) if total_frames > 0 else 0
-
-                # --- Print Progress ---
-                print_interval = 10 # Print every N processed samples
-                if processed_frame_count == 1 or processed_frame_count % print_interval == 0:
-                    print(f"\n--- Processing Frame {frame_number} / {total_frames} ({progress_percent:.1f}%) | Video Time: {video_timestamp_str} ---")
-                    print(f"  (Processing at ~{sample_interval_sec} sec interval)")
-
-                # --- Process Defined ROIs ---
-                ocr_start_time = time.time()
-                if rois: # Check if ROIs are defined
-                    if processed_frame_count == 1 or processed_frame_count % print_interval == 0:
-                        print(f"  Processing {len(rois)} ROIs...")
-
-                    for i, roi_info in enumerate(rois):
-                        roi_id = roi_info['id']; roi_points = roi_info['points']
-                        roi_transform = roi_info.get('transform', {'rotate': 0, 'flip_code': None})
-                        recognized_text_raw = "ERROR"; roi_text_fragments = []
-                        try:
-                            if not (isinstance(roi_points, (list, np.ndarray)) and len(roi_points) == 4): continue
-                            roi_src_points = np.float32(roi_points)
-
-                            # 1. Estimate aspect ratio and define destination points
-                            est_w, est_h = estimate_roi_dims(roi_points)
-                            if est_w < 1: est_w = 1
-                            target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
-                            # Define destination points for warp *dynamically*
-                            current_dst_points = np.float32([[0, 0], [ROI_TARGET_WIDTH - 1, 0], [ROI_TARGET_WIDTH - 1, target_h - 1], [0, target_h - 1]])
-
-                            # 2. Warp ROI
-                            matrix = cv2.getPerspectiveTransform(roi_src_points, current_dst_points)
-                            warped_roi = cv2.warpPerspective(current_frame, matrix, (ROI_TARGET_WIDTH, target_h))
-
-                            # 3. Apply optimal rotation/flip
-                            optimally_transformed_patch = apply_roi_transform(warped_roi, roi_transform)
-                            if optimally_transformed_patch is None: raise ValueError("Apply transform failed")
-
-                            # 4. Apply Enhancement
-                            enhanced_patch_for_ocr = enhance_roi_patch(optimally_transformed_patch)
-                            if enhanced_patch_for_ocr is None: raise ValueError("Enhancement failed")
-
-                            # 5. Perform OCR
-                            ocr_result = ocr_engine.ocr(enhanced_patch_for_ocr, cls=True)
-
-                            # 6. Extract & Post-process Text
-                            if ocr_result and ocr_result[0] is not None:
-                                for line in ocr_result[0]:
-                                    if line and len(line) == 2:
-                                        text_info = line[1]
-                                        if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
-                                            roi_text_fragments.append(text_info[0])
-                            recognized_text_raw = " ".join(roi_text_fragments).strip()
-                            recognized_text_processed = post_process_text(recognized_text_raw)
+        print("\n  --- Controls ---")
+        print("   Mouse Click: Define ROI corners (after pressing 'n')")
+        print("    n: Start NEW ROI | d: DELETE last | c: CLEAR all")
+        print("    s: SAVE ROIs | l: LOAD ROIs | o: Re-OPTIMIZE all ROIs")
+        print("    v: Toggle VIEW warped/optimized patches (when PAUSED)")
+        print("    SPACE: PAUSE / RESUME | q: QUIT (this video)")
+        print("  ----------------")
+    # Reset state variables for each video
+    paused = False; defining_roi = False; current_roi_points = []; show_warped = False
 
 
-                            if recognized_text_processed:
-                                 if not display_enabled or processed_frame_count % print_interval == 0 or processed_frame_count == 1:
-                                     print(f"    > ROI ID {roi_id}: Text = '{recognized_text_processed}' (Raw: '{recognized_text_raw}') (Transform: {roi_transform})")
+    # --- Processing Loop for this video file ---
+    processed_ocr_count = 0; total_ocr_time = 0
+    current_frame = first_frame # Holds the frame currently displayed or being processed
+    last_processed_time_sec = -sample_interval_sec # Ensures first frame can be processed
+    next_sample_time_sec = 0.0 # Time for the next sample
 
-                        except Exception as e:
-                            print(f"\nError processing ROI ID {roi_id}: {e}");
-                            recognized_text_processed = f'Error: {e}' # Store error
-
-                        # --- Write result row to CSV ---
-                        row_data = [video_timestamp_str, frame_number, roi_id, recognized_text_processed]
-                        try:
-                            csv_writer.writerow(row_data)
-                        except Exception as csv_e:
-                            print(f"Error writing to CSV file: {csv_e}")
-
-                total_ocr_time += (time.time() - ocr_start_time) # Add time only when OCR runs
-
-            # --- Display Frame and ROIs (Always update display if enabled) ---
+    while True:
+        # --- Handle Paused State ---
+        if paused:
             if display_enabled:
-                # Draw ROIs
+                # Keep displaying the last frame and handling keys while paused
+                display_frame = current_frame.copy() # Use the frame captured before pausing
+                # Draw ROIs, points being defined, PAUSED text etc.
                 for i, roi_info in enumerate(rois):
                     color_tuple, color_name = ROI_COLORS[i % len(ROI_COLORS)]
                     try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=2); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
                     except Exception as draw_e: print(f"W: Could not draw ROI ID {roi_info['id']}: {draw_e}")
-                # Draw points being defined
                 if defining_roi:
                     for idx, pt in enumerate(current_roi_points): cv2.circle(display_frame, tuple(pt), 5, (0, 255, 255), -1); cv2.putText(display_frame, str(idx+1), (pt[0]+5, pt[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
                     prompt_y_pos = 30; prompt_text = "";
                     if len(current_roi_points) < 4: prompt_text = f"Click point {len(current_roi_points)+1}/4 for ROI ID {next_roi_id}"
                     if prompt_text: cv2.putText(display_frame, prompt_text, (10, prompt_y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                # Draw PAUSED text
-                if paused: cv2.putText(display_frame, "PAUSED", (frame_width - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                if show_warped and paused: cv2.putText(display_frame, "Showing Warped Patches ('v' pressed)", (frame_width - 350, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                # Show main window
+                cv2.putText(display_frame, "PAUSED", (frame_width - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                if show_warped: cv2.putText(display_frame, "Showing Warped Patches ('v' pressed)", (frame_width - 350, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow(window_name, display_frame)
 
                 # Show warped patches if requested ('v' key while paused)
-                if paused and show_warped and rois:
+                if show_warped and rois:
+                    # ... (Code to show warped patches remains the same) ...
                     print("Displaying warped/optimized/enhanced patches...")
                     patch_windows = []
                     for i, roi_info in enumerate(rois):
@@ -508,11 +400,9 @@ def process_video(video_path, output_csv_path, sample_interval_sec=1.0, display_
                          try: cv2.destroyWindow(w_name)
                          except: pass
 
-
-            # --- Handle Key Press (if display enabled) ---
-            key_pressed = -1
-            if display_enabled: key_pressed = cv2.waitKey(1) & 0xFF
-
+            # Handle keys while paused
+            key_pressed = cv2.waitKey(1) & 0xFF # Still need waitKey for interaction
+            # Process keys (q, s, l, n, d, c, o, v, SPACE) - same logic as below
             if key_pressed == ord('q'): break
             elif key_pressed == ord('s'): save_rois(ROI_CONFIG_FILE, rois)
             elif key_pressed == ord('l'): # Load and Optimize
@@ -527,7 +417,7 @@ def process_video(video_path, output_csv_path, sample_interval_sec=1.0, display_
                 if defining_roi and current_roi_points: print("Cancelled defining current ROI.")
                 print("\nStarting new ROI definition: Click 4 points on the window.")
                 current_roi_points = []; defining_roi = True
-                if not paused: paused = True; print("Paused. Click 4 points.")
+                # Already paused
             elif key_pressed == ord('d'): # Delete last ROI
                 if rois: deleted_roi = rois.pop(); print(f"Deleted last ROI (ID {deleted_roi['id']}).")
                 else: print("No ROIs to delete.")
@@ -542,8 +432,7 @@ def process_video(video_path, output_csv_path, sample_interval_sec=1.0, display_
                  elif not rois: print("No ROIs defined to optimize.")
                  else: print("Could not optimize ROIs (no current frame?).")
             elif key_pressed == ord('v'): # Toggle warped patch view
-                 if paused: show_warped = True; print("Will show enhanced/optimized patches now (press any key in patch window to close).")
-                 else: print("Press SPACE to pause first, then 'v' to view patches.")
+                 show_warped = True; print("Will show enhanced/optimized patches now (press any key in patch window to close).")
             elif key_pressed == ord(' '): # Toggle Pause
                 paused = not paused; status_msg = "Paused." if paused else "Resumed."; print(f"\n{status_msg}")
                 if not paused and defining_roi: current_roi_points = []; defining_roi = False; print("Cancelling ROI definition.")
@@ -552,71 +441,307 @@ def process_video(video_path, output_csv_path, sample_interval_sec=1.0, display_
                          try: cv2.destroyWindow(f"ROI {roi_info['id']} Enhanced (Optimal: {roi_info.get('transform')})")
                          except: pass
                      show_warped = False
-            elif not display_enabled and not paused: time.sleep(0.001) # Delay if headless
+            continue # Skip the rest of the loop if paused
+
+        # --- If not paused, calculate next sample time and seek ---
+        # Calculate the time for the next sample based on the *last processed time*
+        next_sample_time_sec = last_processed_time_sec + sample_interval_sec
+        target_frame_number = int(next_sample_time_sec * fps)
+
+        # Ensure target frame is not beyond video length
+        if target_frame_number >= total_frames:
+            print("\nReached end of video based on sampling interval.")
+            break
+
+        # Ensure we don't seek backwards
+        current_frame_number_before_seek = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        target_frame_number = max(current_frame_number_before_seek, target_frame_number)
+
+        # Ensure target is still within bounds after adjustment
+        if target_frame_number >= total_frames:
+             print("\nReached end of video after adjusting target frame.")
+             break
+
+        # --- Seek to the target frame ---
+        # print(f"Seeking to frame {target_frame_number} for time {next_sample_time_sec:.3f}s") # Debug
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_number)
+
+        # --- Read the target frame ---
+        ret, frame = cap.read()
+        if not ret:
+            print(f"\nWarning: Could not read target frame {target_frame_number}. End of video?")
+            break
+        current_frame = frame
+        # The frame number we actually processed is target_frame_number
+        actual_processed_frame_num = target_frame_number
+        if display_enabled: frame_ref[0] = current_frame
 
 
-            # Increment frame number only if not paused
-            if not paused:
-                frame_number += 1
+        # --- OCR Processing for the Sampled Frame ---
+        processed_ocr_count += 1
+        # Update time based on the frame number we *actually* processed
+        last_processed_time_sec = actual_processed_frame_num / fps
+        current_processed_time_sec = last_processed_time_sec
+        video_timestamp_str = format_timedelta(timedelta(seconds=current_processed_time_sec))
+        progress_percent = (actual_processed_frame_num / total_frames * 100) if total_frames > 0 else 0
 
-    # --- Cleanup ---
-    finally: # Ensure CSV file is closed even if errors occur
-        if 'csvfile' in locals() and csvfile and not csvfile.closed:
-            csvfile.close()
-            print("CSV file closed.")
-        cap.release()
+        # Print Progress
+        print(f"\n--- Processing OCR Frame {actual_processed_frame_num} / {total_frames} ({progress_percent:.1f}%) | Video Time: {video_timestamp_str} ---")
+
+        # Process Defined ROIs
+        ocr_start_time = time.time()
+        if rois:
+            print(f"  Processing {len(rois)} ROIs...") # Print header every time OCR runs
+
+            for i, roi_info in enumerate(rois):
+                roi_id = roi_info['id']; roi_points = roi_info['points']
+                roi_transform = roi_info.get('transform', {'rotate': 0, 'flip_code': None})
+                recognized_text_raw = "ERROR"; roi_text_fragments = []
+                try:
+                    if not (isinstance(roi_points, (list, np.ndarray)) and len(roi_points) == 4): continue
+                    roi_src_points = np.float32(roi_points)
+                    est_w, est_h = estimate_roi_dims(roi_points)
+                    if est_w < 1: est_w = 1
+                    target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
+                    current_dst_points = np.float32([[0, 0], [ROI_TARGET_WIDTH - 1, 0], [ROI_TARGET_WIDTH - 1, target_h - 1], [0, target_h - 1]])
+                    matrix = cv2.getPerspectiveTransform(roi_src_points, current_dst_points)
+                    warped_roi = cv2.warpPerspective(current_frame, matrix, (ROI_TARGET_WIDTH, target_h))
+                    optimally_transformed_patch = apply_roi_transform(warped_roi, roi_transform)
+                    if optimally_transformed_patch is None: raise ValueError("Apply transform failed")
+                    enhanced_patch_for_ocr = enhance_roi_patch(optimally_transformed_patch)
+                    if enhanced_patch_for_ocr is None: raise ValueError("Enhancement failed")
+                    ocr_result = ocr_engine.ocr(enhanced_patch_for_ocr, cls=True)
+                    if ocr_result and ocr_result[0] is not None:
+                        for line in ocr_result[0]:
+                            if line and len(line) == 2:
+                                text_info = line[1]
+                                if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
+                                    roi_text_fragments.append(text_info[0])
+                    recognized_text_raw = " ".join(roi_text_fragments).strip()
+                    recognized_text_processed = post_process_text(recognized_text_raw)
+
+                    # --- FIX: Always print result for sampled frame ---
+                    print(f"    > ROI ID {roi_id}: Text = '{recognized_text_processed}' (Raw: '{recognized_text_raw}') (Transform: {roi_transform})")
+
+                except Exception as e: print(f"\nError processing ROI ID {roi_id}: {e}"); recognized_text_processed = f'Error: {e}'
+                # Write result row to CSV
+                row_data = [video_timestamp_str, actual_processed_frame_num, base_filename, roi_id, recognized_text_processed]
+                try: csv_writer.writerow(row_data)
+                except Exception as csv_e: print(f"Error writing to CSV file: {csv_e}")
+
+            total_ocr_time += (time.time() - ocr_start_time)
+
+        # --- Display Sampled Frame (if enabled) ---
         if display_enabled:
-            try: cv2.destroyAllWindows()
-            except Exception as e: print(f"Warning: Error destroying OpenCV windows: {e}")
+            display_frame = current_frame.copy() # Use the frame we just processed
+            # Draw ROIs
+            for i, roi_info in enumerate(rois):
+                color_tuple, color_name = ROI_COLORS[i % len(ROI_COLORS)]
+                try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=2); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
+                except Exception as draw_e: print(f"W: Could not draw ROI ID {roi_info['id']}: {draw_e}")
+            # Draw points being defined (shouldn't happen here)
+            if defining_roi: pass
+            # Draw PAUSED text (shouldn't happen here)
+            if paused: pass
+            cv2.imshow(window_name, display_frame)
 
-    # --- Final Summary ---
-    print(f"\nVideo processing finished or stopped. Processed OCR on {processed_frame_count} frames.")
-    if processed_frame_count > 0 and rois:
-      # Calculate average time per frame where OCR was actually run
-      avg_ocr_time_per_active_frame = total_ocr_time / processed_frame_count if processed_frame_count > 0 else 0
-      print(f"Average OCR processing time per sampled frame: {avg_ocr_time_per_active_frame:.4f} seconds")
 
-    # --- Final Save Results (Removed - now saving incrementally) ---
-    print(f"Output data saved incrementally to '{output_csv_path}'")
+        # --- Handle Key Press (if display enabled) ---
+        key_pressed = -1
+        if display_enabled:
+            key_pressed = cv2.waitKey(1) & 0xFF # Wait 1ms
+        elif not paused: # If display disabled, add delay only when not paused
+             time.sleep(0.001) # Prevent 100% CPU usage when headless
+
+        # Process keys (q, s, l, n, d, c, o, v, SPACE)
+        if key_pressed == ord('q'):
+             print(f"\n'q' pressed, stopping processing for {base_filename}.")
+             break # Exit loop for this video file
+        elif key_pressed == ord('s'): save_rois(ROI_CONFIG_FILE, rois)
+        elif key_pressed == ord('l'): # Load and Optimize
+            rois_loaded = load_rois(ROI_CONFIG_FILE); current_roi_points = []; defining_roi = False
+            if rois_loaded and rois and current_frame is not None:
+                print("Optimizing transforms for reloaded ROIs...")
+                for i in range(len(rois)): optimize_roi_transform(i, current_frame, ocr_engine)
+                print("Finished optimizing reloaded ROIs.")
+            elif not rois: print("Config file loaded, but no valid ROIs found.")
+            else: print("Could not optimize loaded ROIs (no current frame?).")
+        elif key_pressed == ord('n'): # New ROI
+            if defining_roi and current_roi_points: print("Cancelled defining current ROI.")
+            print("\nStarting new ROI definition: Click 4 points on the window.")
+            current_roi_points = []; defining_roi = True
+            if not paused: paused = True; print("Paused. Click 4 points.")
+        elif key_pressed == ord('d'): # Delete last ROI
+            if rois: deleted_roi = rois.pop(); print(f"Deleted last ROI (ID {deleted_roi['id']}).")
+            else: print("No ROIs to delete.")
+            if defining_roi: current_roi_points = []; defining_roi = False
+        elif key_pressed == ord('c'): # Clear all ROIs
+            print("Cleared all ROIs."); rois = []; current_roi_points = []; defining_roi = False; next_roi_id = 0
+        elif key_pressed == ord('o'): # Optimize all current ROIs
+             if rois and current_frame is not None:
+                 print("Re-optimizing transforms for all current ROIs...")
+                 for i in range(len(rois)): optimize_roi_transform(i, current_frame, ocr_engine)
+                 print("Finished re-optimizing ROIs.")
+             elif not rois: print("No ROIs defined to optimize.")
+             else: print("Could not optimize ROIs (no current frame?).")
+        elif key_pressed == ord('v'): # Toggle warped patch view
+             if paused: show_warped = True; print("Will show enhanced/optimized patches now (press any key in patch window to close).")
+             else: print("Press SPACE to pause first, then 'v' to view patches.")
+        elif key_pressed == ord(' '): # Toggle Pause
+            paused = not paused; status_msg = "Paused." if paused else "Resumed."; print(f"\n{status_msg}")
+            if not paused and defining_roi: current_roi_points = []; defining_roi = False; print("Cancelling ROI definition.")
+            if not paused: # Destroy patch windows on resume
+                 for i, roi_info in enumerate(rois):
+                     try: cv2.destroyWindow(f"ROI {roi_info['id']} Enhanced (Optimal: {roi_info.get('transform')})")
+                     except: pass
+                 show_warped = False
+        # Removed redundant sleep when display disabled and paused
+
+
+        # --- Loop Increment (Frame number is now set by seek) ---
+        # No frame_number increment needed here when seeking
+
+
+    # --- Cleanup for this video file ---
+    cap.release()
+    if display_enabled:
+        try: cv2.destroyWindow(window_name) # Close the specific window for this video
+        except Exception: pass # Ignore error if already closed
+    print(f"Finished processing {base_filename}. Processed OCR on {processed_ocr_count} frames.")
+    if processed_ocr_count > 0 and rois:
+        # Calculate average time per frame where OCR was actually run
+        avg_ocr_time_per_active_frame = total_ocr_time / processed_ocr_count if processed_ocr_count > 0 else 0
+        print(f"  Average OCR processing time per sampled frame: {avg_ocr_time_per_active_frame:.4f} seconds")
+    return True # Indicate success for this file
 
 
 # --- Script Execution Entry Point ---
 if __name__ == "__main__":
-    # Argument parsing - updated for sample_interval_sec
-    if len(sys.argv) < 2:
-        print("\nUsage: python your_script_name.py <path_to_video.avi> [output_csv_file] [sample_interval_sec]")
-        print("\nArguments:")
-        print("  <path_to_video.avi>: Path to input video (required).")
-        print("  [output_csv_file]:   Optional. Path for output CSV. Defaults to 'roi_ocr_results.csv'.")
-        print("  [sample_interval_sec]: Optional. Seconds between OCR attempts. Defaults to 1.0.")
-        print("\nRequires: paddleocr, paddlepaddle-gpu (or paddlepaddle), opencv-python, pandas, numpy")
-        print("\nExample:")
-        print("  python your_script_name.py movie.avi roi_results.csv 0.5") # Sample every 0.5 seconds
-        sys.exit(1)
+    # --- Argument Parsing (Using argparse) ---
+    parser = argparse.ArgumentParser(description="Extract text from ROIs in video files using OCR.")
+    parser.add_argument("input_paths", nargs='+', help="Path(s) to video file(s), directory, or glob pattern (e.g., 'videos/*.avi').")
+    parser.add_argument("-o", "--output-csv", default="ocr_results.csv", help="Path for the output CSV file (defaults to 'ocr_results.csv').")
+    parser.add_argument("-i", "--interval", type=float, default=1.0, dest='sample_interval_sec', help="Seconds between OCR attempts (defaults to 1.0).")
+    parser.add_argument("--no-display", action="store_true", help="Disable the GUI display window.")
+    parser.add_argument("--force-cpu", action="store_true", help="Force PaddleOCR to use CPU even if GPU is available.")
 
-    video_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else "roi_ocr_results.csv"
-    interval_sec = 1.0 # Default sample interval
-    if len(sys.argv) > 3:
-        try:
-            interval_sec = float(sys.argv[3])
-            if interval_sec <= 0:
-                 print("Warning: Sample interval must be positive. Using default 1.0 second.")
-                 interval_sec = 1.0
-        except ValueError:
-            print("Error: Sample interval must be a number. Using default 1.0 second.")
-            interval_sec = 1.0
+    args = parser.parse_args()
 
-    # Run the main processing function
+    # Validate sample interval
+    if args.sample_interval_sec <= 0:
+        print("Warning: Sample interval must be positive. Using default 1.0 second.")
+        args.sample_interval_sec = 1.0
+
+    # Update global flags based on args
+    ENABLE_DISPLAY = not args.no_display
+    FORCE_CPU = args.force_cpu
+
+    # --- Find Video Files ---
+    video_files = []
+    for path_pattern in args.input_paths:
+        # Check if it's a directory
+        if os.path.isdir(path_pattern):
+            print(f"Input path '{path_pattern}' is a directory. Searching...")
+            supported_extensions = ['*.avi', '*.mp4', '*.mov', '*.mkv', '*.wmv']
+            for ext in supported_extensions:
+                video_files.extend(glob.glob(os.path.join(path_pattern, ext), recursive=True))
+        # Check if it's a glob pattern
+        elif '*' in path_pattern or '?' in path_pattern:
+            print(f"Input path '{path_pattern}' is a glob pattern. Searching...")
+            recursive_glob = '**' in path_pattern
+            video_files.extend(glob.glob(path_pattern, recursive=recursive_glob))
+        # Check if it's a single file
+        elif os.path.isfile(path_pattern):
+            video_files.append(path_pattern)
+        else:
+            print(f"Warning: Input path '{path_pattern}' is not a valid file, directory, or glob pattern. Skipping.")
+
+    # Remove duplicates and sort
+    video_files = sorted(list(set(video_files)))
+
+    if not video_files: print(f"No valid video files found matching input. Exiting."); sys.exit(0)
+
+    print(f"\n--- Configuration ---")
+    print(f"Input Path(s)/Pattern(s): {', '.join(args.input_paths)}")
+    print(f"Output CSV File:    {args.output_csv}")
+    print(f"Sample Interval:    {args.sample_interval_sec} seconds")
+    print(f"Display Enabled:    {ENABLE_DISPLAY}")
+    print(f"Force CPU:          {FORCE_CPU}")
+    print(f"Found {len(video_files)} video file(s) to process:")
+    for f in video_files: print(f"  - {f}")
+    print(f"--------------------\n")
+
+
+    # --- Initialize PaddleOCR (once) ---
+    print("\nInitializing PaddleOCR (attempting GPU)...")
     try:
-        process_video(video_file, output_file, sample_interval_sec=interval_sec, display_enabled=ENABLE_DISPLAY)
-    except (FileNotFoundError, IOError, ImportError, Exception) as e:
-        print(f"\nAn critical error occurred: {e}")
-        # Attempt cleanup even on critical error
-        if 'cap' in locals() and 'cap' in globals() and cap.isOpened(): cap.release()
+        ocr_engine_main = paddleocr.PaddleOCR(
+            use_angle_cls=True, lang='en', use_gpu=(not FORCE_CPU), show_log=False,
+            det_db_unclip_ratio=PADDLE_UNCLIP_RATIO,
+            det_db_thresh=PADDLE_DB_THRESH,
+            det_db_box_thresh=PADDLE_BOX_THRESH
+        )
+        print("PaddleOCR initialized.");
+        print(f"  Using Params: UnclipRatio={PADDLE_UNCLIP_RATIO}, DBThresh={PADDLE_DB_THRESH}, BoxThresh={PADDLE_BOX_THRESH}")
+        if FORCE_CPU: print("PaddleOCR running on CPU (forced).")
+        else: print("PaddleOCR attempting GPU.")
+    except Exception as e: print(f"Error initializing PaddleOCR: {e}"); sys.exit(1)
+
+    # --- Load ROIs (once) ---
+    rois_loaded = load_rois(ROI_CONFIG_FILE)
+    if not rois_loaded and ENABLE_DISPLAY: print("No ROI config found. Define ROIs for the first video.")
+    elif not rois_loaded and not ENABLE_DISPLAY: print("Error: No ROI config found and display is disabled. Exiting."); sys.exit(1)
+
+    # --- Setup CSV File (once) ---
+    csv_headers = ['Video Time', 'Frame', 'Filename', 'ROI ID', 'Recognized Text'] # Added Filename
+    file_exists = os.path.exists(args.output_csv)
+    csvfile = None; csv_writer = None
+    try:
+        # Ensure the directory for the output file exists
+        output_dir = os.path.dirname(args.output_csv)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"Created output directory: {output_dir}")
+
+        csvfile = open(args.output_csv, 'a', newline='', encoding='utf-8')
+        csv_writer = csv.writer(csvfile, quoting=csv.QUOTE_ALL)
+        if not file_exists or os.path.getsize(args.output_csv) == 0:
+            csv_writer.writerow(csv_headers)
+            print(f"\nWriting new CSV file: {args.output_csv}")
+        else: print(f"\nAppending to existing CSV file: {args.output_csv}")
+    except IOError as e: print(f"Error opening CSV file {args.output_csv}: {e}"); sys.exit(1)
+
+    # --- Process Each Video File ---
+    overall_success = True
+    try:
+        for video_file_path in video_files:
+            paused = False # Ensure each video starts unpaused
+            success = process_video_file(
+                video_file_path,
+                csv_writer,
+                ocr_engine_main,
+                sample_interval_sec=args.sample_interval_sec, # Pass parsed time interval
+                display_enabled=ENABLE_DISPLAY
+            )
+            if not success:
+                overall_success = False
+                # break # Optional: Stop processing further files on error
+
+    except Exception as e: # Catch broader exceptions here
+        print(f"\nAn critical error occurred during processing loop: {e}")
+        # ADD TRACEBACK HERE
+        print("\n----- Traceback -----")
+        traceback.print_exc()
+        print("---------------------\n")
+        overall_success = False
+    finally:
+        # --- Final Cleanup ---
+        if csvfile and not csvfile.closed: csvfile.close(); print("CSV file closed.")
         if ENABLE_DISPLAY:
-             try: cv2.destroyAllWindows()
-             except: pass
-        if 'csvfile' in locals() and 'csvfile' in globals() and csvfile and not csvfile.closed: csvfile.close()
-        sys.exit(1)
+            try: cv2.destroyAllWindows()
+            except Exception: pass
+
+    print("\n===== Processing Complete =====")
+    if not overall_success: print("Some files may not have been processed successfully."); sys.exit(1)
+    else: print("All files processed successfully."); sys.exit(0)
 
