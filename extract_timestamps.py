@@ -1,6 +1,7 @@
 # Import necessary libraries
 import cv2
 import paddleocr
+import paddle # Import paddle for GPU info
 import sys
 import os
 import csv
@@ -32,12 +33,15 @@ APPLY_GRAYSCALE = True
 ENHANCE_CONTRAST = True
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID_SIZE = (8, 8)
+APPLY_THRESHOLDING = False # Optional: Apply Otsu's thresholding after CLAHE
 # --- >>> PaddleOCR Tuning Parameters <<< ---
 PADDLE_UNCLIP_RATIO = 2.0
 PADDLE_BOX_THRESH = 0.6
 PADDLE_DB_THRESH = 0.3
 # --- >>> Optimization Parameters <<< ---
 NORMAL_ORIENTATION_CONF_THRESHOLD = 0.85
+# --- >>> Best-of-3 Sampling Parameters <<< ---
+CHECK_ADJACENT_CONF_THRESHOLD = 1.1 # Currently not used in ROI-Win logic
 
 # --- Global Variables for Interaction ---
 rois = [] # List of ROI dicts
@@ -56,11 +60,6 @@ ROI_COLORS = [
 ]
 
 # --- Helper Functions ---
-# format_timedelta, load_rois, save_rois, apply_roi_transform,
-# calculate_avg_confidence, estimate_roi_dims, calculate_roi_angle,
-# get_closest_rotation, enhance_roi_patch, post_process_text,
-# optimize_roi_transform, mouse_callback
-# (These functions remain the same as the previous version)
 
 def format_timedelta(td):
     """Formats a timedelta object into a HH:MM:SS.fff string."""
@@ -120,17 +119,35 @@ def apply_roi_transform(patch, transform):
     if flip_code is not None: transformed_patch = cv2.flip(transformed_patch, flip_code)
     return transformed_patch
 
-def calculate_avg_confidence(ocr_result):
-    """Calculates average confidence from PaddleOCR result."""
-    total_confidence = 0; count = 0
+def calculate_ocr_stats(ocr_result):
+    """
+    Calculates average and minimum confidence from PaddleOCR result for a single ROI.
+    Args:
+        ocr_result: The direct output from paddle_ocr.ocr() for a single image patch.
+                    Expected format: [[line1], [line2], ...] where line = [[box], (text, confidence)]
+                    OR None if no text detected.
+    Returns:
+        tuple: (average_confidence, minimum_confidence)
+               Returns (0.0, 0.0) if no valid confidence scores found.
+    """
+    confidences = []
+    # --- FIX: Handle the outer list structure from PaddleOCR ---
     if ocr_result and ocr_result[0] is not None:
-        for line in ocr_result[0]:
-            if line and len(line) == 2:
+        for line in ocr_result[0]: # Iterate through the actual lines detected
+             if line and len(line) == 2:
                 text_info = line[1]
                 if isinstance(text_info, (list, tuple)) and len(text_info) > 1:
                     confidence = text_info[1]
-                    if isinstance(confidence, (float, int)): total_confidence += confidence; count += 1
-    return total_confidence / count if count > 0 else 0.0
+                    if isinstance(confidence, (float, int)):
+                        confidences.append(confidence)
+
+    if not confidences:
+        return 0.0, 0.0
+
+    avg_conf = sum(confidences) / len(confidences)
+    min_conf = min(confidences)
+    return avg_conf, min_conf
+
 
 def estimate_roi_dims(roi_points):
     """Estimates the width and height of the quadrilateral defined by roi_points."""
@@ -168,22 +185,49 @@ def get_closest_rotation(angle_deg):
     else: return 0
 
 def enhance_roi_patch(patch):
-    """Applies preprocessing (grayscale, contrast enhancement) to the ROI patch."""
+    """Applies preprocessing (grayscale, contrast enhancement, optional thresholding) to the ROI patch."""
     if patch is None: return None
     enhanced_patch = patch
+
     if APPLY_GRAYSCALE:
         if len(enhanced_patch.shape) == 3 and enhanced_patch.shape[2] == 3:
             enhanced_patch = cv2.cvtColor(enhanced_patch, cv2.COLOR_BGR2GRAY)
+        # else: already grayscale or invalid
+
     if ENHANCE_CONTRAST and len(enhanced_patch.shape) == 2: # CLAHE needs grayscale
         try:
             clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
             enhanced_patch = clahe.apply(enhanced_patch)
         except Exception as e:
             print(f"Warning: Failed to apply CLAHE enhancement: {e}")
-            if len(patch.shape) == 3 and patch.shape[2] == 3: enhanced_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-            elif len(patch.shape) == 2: enhanced_patch = patch
-            else: enhanced_patch = patch
+            # Fallback to original grayscale if CLAHE fails
+            if len(patch.shape) == 3 and patch.shape[2] == 3:
+                 enhanced_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            elif len(patch.shape) == 2:
+                 enhanced_patch = patch # Use original grayscale if already gray
+            else: # If original wasn't color or gray, return original
+                 enhanced_patch = patch
+
+    if APPLY_THRESHOLDING and len(enhanced_patch.shape) == 2: # Thresholding needs grayscale
+         try:
+             # Apply Otsu's thresholding
+             _ , enhanced_patch = cv2.threshold(enhanced_patch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+         except Exception as e:
+             print(f"Warning: Failed to apply thresholding: {e}")
+             # Revert to previous state (grayscale or CLAHE'd) if thresholding fails
+             # This requires re-applying grayscale if contrast wasn't applied
+             if APPLY_GRAYSCALE and not ENHANCE_CONTRAST:
+                 if len(patch.shape) == 3 and patch.shape[2] == 3:
+                     enhanced_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                 elif len(patch.shape) == 2:
+                     enhanced_patch = patch
+                 else:
+                     enhanced_patch = patch # Fallback to original
+             # If CLAHE was applied, enhanced_patch already holds that result
+             # If neither was applied, enhanced_patch holds original
+
     return enhanced_patch
+
 
 def post_process_text(text):
     """Applies simple regex fixes to common OCR spacing/punctuation issues."""
@@ -224,11 +268,11 @@ def optimize_roi_transform(roi_index, frame, ocr_engine):
             enhanced_standard_patch = enhance_roi_patch(standard_patch)
             if enhanced_standard_patch is not None:
                 ocr_result_standard = ocr_engine.ocr(enhanced_standard_patch, cls=True)
-                standard_confidence = calculate_avg_confidence(ocr_result_standard)
-                print(f"  Confidence for Standard Orientation (Rot 0, No Flip): {standard_confidence:.4f}")
+                standard_confidence, _ = calculate_ocr_stats(ocr_result_standard) # Use new helper
+                print(f"  Confidence for Standard Orientation (Rot 0, No Flip): {standard_confidence:.6f}") # Increased precision
                 if standard_confidence >= NORMAL_ORIENTATION_CONF_THRESHOLD:
                     print(f"  Prioritizing standard orientation."); best_transform = standard_transform.copy(); best_score = standard_confidence
-                    rois[roi_index]['transform'] = best_transform; print(f"--- Opt Complete ROI #{roi_id} ---"); print(f"  Best: {best_transform}, Score: {best_score:.4f}"); return
+                    rois[roi_index]['transform'] = best_transform; print(f"--- Opt Complete ROI #{roi_id} ---"); print(f"  Best: {best_transform}, Score: {best_score:.6f}"); return # Increased precision
 
         # If standard not good enough, test flips for target rotation
         print(f"  Standard conf below threshold. Testing flips for target rot {target_rotation}...")
@@ -239,7 +283,7 @@ def optimize_roi_transform(roi_index, frame, ocr_engine):
              enhanced_patch_target_noflip = enhance_roi_patch(transformed_patch_target_noflip)
              if enhanced_patch_target_noflip is not None:
                   ocr_result_target_noflip = ocr_engine.ocr(enhanced_patch_target_noflip, cls=True)
-                  best_score = calculate_avg_confidence(ocr_result_target_noflip)
+                  best_score, _ = calculate_ocr_stats(ocr_result_target_noflip) # Use new helper
                   best_transform = transform_params_target_noflip.copy()
 
         # Test other flips for the target rotation
@@ -250,12 +294,12 @@ def optimize_roi_transform(roi_index, frame, ocr_engine):
             enhanced_patch_for_ocr = enhance_roi_patch(transformed_patch)
             if enhanced_patch_for_ocr is None: continue
             ocr_result = ocr_engine.ocr(enhanced_patch_for_ocr, cls=True)
-            avg_confidence = calculate_avg_confidence(ocr_result)
+            avg_confidence, _ = calculate_ocr_stats(ocr_result) # Use new helper
             if avg_confidence > best_score: best_score = avg_confidence; best_transform = transform_params.copy()
 
         rois[roi_index]['transform'] = best_transform
         print(f"--- Optimization Complete for ROI #{roi_id} ---")
-        print(f"  Best Transform (TargetRot {target_rotation}): {best_transform}, Score: {best_score:.4f}")
+        print(f"  Best Transform (TargetRot {target_rotation}): {best_transform}, Score: {best_score:.6f}") # Increased precision
     except Exception as e:
         print(f"Error during optimization for ROI #{roi_id}: {e}")
         rois[roi_index]['transform'] = {'rotate': 0, 'flip_code': None}
@@ -285,12 +329,84 @@ def mouse_callback(event, x, y, flags, param):
                 print(f"ROI #{current_roi_id} optimization done. Press 'n' for new ROI, 'd' to delete last, 's' to save.")
 
 
+def process_single_frame_ocr(frame, frame_idx, ocr_engine):
+    """
+    Performs OCR on all ROIs for a single frame.
+    Returns:
+        dict: {roi_id: {'text': str, 'confidence': float, 'raw_text': str, 'min_confidence': float}}
+        float: Average confidence across all ROIs in this frame (used for best-of-3 selection).
+    """
+    if frame is None or not rois:
+        return {}, 0.0
+
+    frame_results = {}
+    total_avg_confidence_sum = 0.0 # Sum of average confidences *per ROI*
+    rois_processed_count = 0
+
+    for i, roi_info in enumerate(rois):
+        roi_id = roi_info['id']; roi_points = roi_info['points']
+        roi_transform = roi_info.get('transform', {'rotate': 0, 'flip_code': None})
+        recognized_text_raw = "ERROR"; roi_text_fragments = []
+        avg_conf_this_roi = 0.0
+        min_conf_this_roi = 0.0
+        try:
+            if not (isinstance(roi_points, (list, np.ndarray)) and len(roi_points) == 4): continue
+            roi_src_points = np.float32(roi_points)
+            est_w, est_h = estimate_roi_dims(roi_points)
+            if est_w < 1: est_w = 1
+            target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
+            current_dst_points = np.float32([[0, 0], [ROI_TARGET_WIDTH - 1, 0], [ROI_TARGET_WIDTH - 1, target_h - 1], [0, target_h - 1]])
+            matrix = cv2.getPerspectiveTransform(roi_src_points, current_dst_points)
+            warped_roi = cv2.warpPerspective(frame, matrix, (ROI_TARGET_WIDTH, target_h))
+            optimally_transformed_patch = apply_roi_transform(warped_roi, roi_transform)
+            if optimally_transformed_patch is None: raise ValueError("Apply transform failed")
+            enhanced_patch_for_ocr = enhance_roi_patch(optimally_transformed_patch)
+            if enhanced_patch_for_ocr is None: raise ValueError("Enhancement failed")
+
+            ocr_result = ocr_engine.ocr(enhanced_patch_for_ocr, cls=True)
+
+            # Extract text and calculate average/min confidence for *this ROI*
+            avg_conf_this_roi, min_conf_this_roi = calculate_ocr_stats(ocr_result) # Use helper
+
+            # Extract raw text fragments
+            if ocr_result and ocr_result[0] is not None:
+                 for line in ocr_result[0]:
+                    if line and len(line) == 2:
+                        text_info = line[1]
+                        if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
+                            roi_text_fragments.append(text_info[0])
+
+            recognized_text_raw = " ".join(roi_text_fragments).strip()
+            recognized_text_processed = post_process_text(recognized_text_raw)
+
+        except Exception as e:
+            print(f"\nError processing ROI ID {roi_id} on frame {frame_idx}: {e}");
+            recognized_text_processed = f'Error: {e}'
+            recognized_text_raw = "ERROR" # Ensure raw text reflects error too
+            avg_conf_this_roi = 0.0 # Assign 0 confidence on error
+            min_conf_this_roi = 0.0
+
+        # Store detailed results for this ROI
+        frame_results[roi_id] = {
+            'text': recognized_text_processed,
+            'confidence': avg_conf_this_roi, # Average confidence for this ROI in this frame
+            'raw_text': recognized_text_raw,
+            'min_confidence': min_conf_this_roi # Minimum line confidence for this ROI in this frame
+        }
+        total_avg_confidence_sum += avg_conf_this_roi # Sum average confidences for overall average later
+        rois_processed_count += 1
+
+    # Calculate average confidence for this frame across all ROIs processed
+    overall_avg_confidence = total_avg_confidence_sum / rois_processed_count if rois_processed_count > 0 else 0.0
+    return frame_results, overall_avg_confidence
+
 # --- Main Processing Function ---
 frame_for_opt = None # Global to hold frame for optimization callback
 
 def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1.0, display_enabled=True):
     """
     Processes a single video file with time-based sampling and frame skipping display.
+    Selects the best frame among [target-1, target, target+1] based on ROI wins.
     Handles ROI processing, OCR, display, and CSV writing.
     Returns True if successful, False otherwise.
     """
@@ -444,105 +560,163 @@ def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1
             continue # Skip the rest of the loop if paused
 
         # --- If not paused, calculate next sample time and seek ---
-        # Calculate the time for the next sample based on the *last processed time*
         next_sample_time_sec = last_processed_time_sec + sample_interval_sec
         target_frame_number = int(next_sample_time_sec * fps)
 
-        # Ensure target frame is not beyond video length
         if target_frame_number >= total_frames:
             print("\nReached end of video based on sampling interval.")
             break
 
-        # Ensure we don't seek backwards
-        current_frame_number_before_seek = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-        target_frame_number = max(current_frame_number_before_seek, target_frame_number)
-
-        # Ensure target is still within bounds after adjustment
+        # Ensure target frame is valid
+        target_frame_number = max(0, target_frame_number)
         if target_frame_number >= total_frames:
-             print("\nReached end of video after adjusting target frame.")
-             break
-
-        # --- Seek to the target frame ---
-        # print(f"Seeking to frame {target_frame_number} for time {next_sample_time_sec:.3f}s") # Debug
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_number)
-
-        # --- Read the target frame ---
-        ret, frame = cap.read()
-        if not ret:
-            print(f"\nWarning: Could not read target frame {target_frame_number}. End of video?")
+            print("\nTarget frame exceeds total frames.")
             break
-        current_frame = frame
-        # The frame number we actually processed is target_frame_number
-        actual_processed_frame_num = target_frame_number
-        if display_enabled: frame_ref[0] = current_frame
+
+        # --- Seek and Read the Target Frame and Neighbors ---
+        frames_to_check = {} # {frame_idx: frame_object}
+        neighbor_indices = [target_frame_number - 1, target_frame_number, target_frame_number + 1]
+
+        for frame_idx_to_read in neighbor_indices:
+            # Skip invalid frame numbers (negative or beyond end)
+            if frame_idx_to_read < 0 or frame_idx_to_read >= total_frames:
+                continue
+
+            # print(f"Seeking/Reading frame {frame_idx_to_read}") # Debug
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx_to_read)
+            ret, frame = cap.read()
+            if ret:
+                frames_to_check[frame_idx_to_read] = frame
+            else:
+                print(f"Warning: Failed to read frame {frame_idx_to_read}")
+
+        if not frames_to_check:
+             print(f"Warning: Could not read target frame {target_frame_number} or its neighbors. Skipping sample.")
+             last_processed_time_sec = next_sample_time_sec # Advance time anyway to avoid getting stuck
+             continue
 
 
-        # --- OCR Processing for the Sampled Frame ---
-        processed_ocr_count += 1
-        # Update time based on the frame number we *actually* processed
-        last_processed_time_sec = actual_processed_frame_num / fps
-        current_processed_time_sec = last_processed_time_sec
+        # --- OCR Processing and Best Frame Selection ---
+        best_frame_index = -1
+        best_frame_results = {}
+        best_frame_object = None
+        highest_win_count = -1
+        frame_wins = {idx: 0 for idx in frames_to_check.keys()} # {frame_idx: win_count}
+        frame_data = {} # {frame_idx: {'results': roi_results_dict, 'avg_conf': avg_conf}}
+        # --- Store max confidences per ROI across checked frames ---
+        roi_max_confidences = {} # {roi_id: max_avg_confidence_found}
+
+
+        ocr_start_time = time.time()
+
+        # Process each candidate frame
+        for frame_idx, frame_obj in frames_to_check.items():
+            roi_results, avg_conf = process_single_frame_ocr(frame_obj, frame_idx, ocr_engine)
+            frame_data[frame_idx] = {'results': roi_results, 'avg_conf': avg_conf} # Store results and confidences
+
+        # Compare ROI confidences across frames
+        if len(frames_to_check) > 1 and rois:
+            print(f"  Comparing frames: {list(frames_to_check.keys())}")
+            # Use set of all ROI IDs present in the results across frames being checked
+            all_roi_ids_in_frames = set()
+            for fd in frame_data.values():
+                all_roi_ids_in_frames.update(fd['results'].keys())
+
+            for roi_id in all_roi_ids_in_frames:
+                best_conf_for_roi = -1.0
+                best_frame_for_roi = -1
+
+                for frame_idx in frames_to_check.keys():
+                    # Check if this ROI ID exists in this frame's results
+                    if roi_id in frame_data[frame_idx]['results']:
+                        roi_conf = frame_data[frame_idx]['results'][roi_id]['confidence']
+                        if roi_conf > best_conf_for_roi:
+                            best_conf_for_roi = roi_conf
+                            best_frame_for_roi = frame_idx
+                        # --- Store the max confidence found for this ROI ---
+                        roi_max_confidences[roi_id] = max(roi_max_confidences.get(roi_id, -1.0), roi_conf)
+
+
+                if best_frame_for_roi != -1:
+                    frame_wins[best_frame_for_roi] += 1
+                    # print(f"    ROI {roi_id} best in frame {best_frame_for_roi} (Conf: {best_conf_for_roi:.6f})") # Debug
+
+
+            # Find the frame with the most wins
+            best_frame_index = max(frame_wins, key=frame_wins.get)
+            highest_win_count = frame_wins[best_frame_index]
+            print(f"  Selected best frame: {best_frame_index} (won {highest_win_count} ROIs)")
+
+        elif frames_to_check: # Only one frame was checked
+            best_frame_index = list(frames_to_check.keys())[0]
+            print(f"  Using single processed frame: {best_frame_index}")
+            # Populate max confidences for the single frame
+            if best_frame_index in frame_data:
+                 for roi_id, res_data in frame_data[best_frame_index]['results'].items():
+                     roi_max_confidences[roi_id] = res_data['confidence']
+
+
+        # Get the data for the selected best frame
+        if best_frame_index != -1:
+            best_frame_results = frame_data[best_frame_index]['results']
+            best_frame_object = frames_to_check[best_frame_index]
+            current_frame = best_frame_object # Update current frame for display/next pause
+            if display_enabled: frame_ref[0] = current_frame
+            actual_processed_frame_num = best_frame_index
+        else:
+            # Fallback if something went wrong
+            print("Error: Could not determine best frame.")
+            actual_processed_frame_num = target_frame_number # Fallback
+            best_frame_results = {} # Empty results
+            best_frame_object = frames_to_check.get(target_frame_number)
+            if best_frame_object: current_frame = best_frame_object # Update if possible
+            if display_enabled and current_frame: frame_ref[0] = current_frame
+
+
+        total_ocr_time += (time.time() - ocr_start_time)
+        processed_ocr_count += 1 # Count this sample interval
+
+        # --- Write results for the BEST frame to CSV ---
+        current_processed_time_sec = actual_processed_frame_num / fps
         video_timestamp_str = format_timedelta(timedelta(seconds=current_processed_time_sec))
         progress_percent = (actual_processed_frame_num / total_frames * 100) if total_frames > 0 else 0
 
-        # Print Progress
-        print(f"\n--- Processing OCR Frame {actual_processed_frame_num} / {total_frames} ({progress_percent:.1f}%) | Video Time: {video_timestamp_str} ---")
+        print(f"\n--- Writing results for Frame {actual_processed_frame_num} / {total_frames} ({progress_percent:.1f}%) | Video Time: {video_timestamp_str} ---")
+        if best_frame_results:
+             print(f"  Processing {len(best_frame_results)} ROIs...") # Print header every time
+             for roi_id, result_data in best_frame_results.items():
+                 # --- Calculate Min Avg Confidence Across Frames for this ROI ---
+                 min_avg_conf_across_frames = 1.0 # Initialize high
+                 for frame_idx in frames_to_check.keys():
+                     if roi_id in frame_data[frame_idx]['results']:
+                         min_avg_conf_across_frames = min(min_avg_conf_across_frames, frame_data[frame_idx]['results'][roi_id]['confidence'])
+                 if min_avg_conf_across_frames == 1.0: # Handle case where ROI wasn't found in any frame
+                     min_avg_conf_across_frames = 0.0
 
-        # Process Defined ROIs
-        ocr_start_time = time.time()
-        if rois:
-            print(f"  Processing {len(rois)} ROIs...") # Print header every time OCR runs
+                 # Get the confidence from the winning frame
+                 conf_winning_frame = result_data['confidence']
 
-            for i, roi_info in enumerate(rois):
-                roi_id = roi_info['id']; roi_points = roi_info['points']
-                roi_transform = roi_info.get('transform', {'rotate': 0, 'flip_code': None})
-                recognized_text_raw = "ERROR"; roi_text_fragments = []
-                try:
-                    if not (isinstance(roi_points, (list, np.ndarray)) and len(roi_points) == 4): continue
-                    roi_src_points = np.float32(roi_points)
-                    est_w, est_h = estimate_roi_dims(roi_points)
-                    if est_w < 1: est_w = 1
-                    target_h = max(1, int(ROI_TARGET_WIDTH * (est_h / est_w)))
-                    current_dst_points = np.float32([[0, 0], [ROI_TARGET_WIDTH - 1, 0], [ROI_TARGET_WIDTH - 1, target_h - 1], [0, target_h - 1]])
-                    matrix = cv2.getPerspectiveTransform(roi_src_points, current_dst_points)
-                    warped_roi = cv2.warpPerspective(current_frame, matrix, (ROI_TARGET_WIDTH, target_h))
-                    optimally_transformed_patch = apply_roi_transform(warped_roi, roi_transform)
-                    if optimally_transformed_patch is None: raise ValueError("Apply transform failed")
-                    enhanced_patch_for_ocr = enhance_roi_patch(optimally_transformed_patch)
-                    if enhanced_patch_for_ocr is None: raise ValueError("Enhancement failed")
-                    ocr_result = ocr_engine.ocr(enhanced_patch_for_ocr, cls=True)
-                    if ocr_result and ocr_result[0] is not None:
-                        for line in ocr_result[0]:
-                            if line and len(line) == 2:
-                                text_info = line[1]
-                                if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
-                                    roi_text_fragments.append(text_info[0])
-                    recognized_text_raw = " ".join(roi_text_fragments).strip()
-                    recognized_text_processed = post_process_text(recognized_text_raw)
+                 # --- Print with correct confidence values and labels ---
+                 print(f"    > ROI ID {roi_id}: Text = '{result_data['text']}' (Raw: '{result_data['raw_text']}') (Confidence: {conf_winning_frame:.6f}) (MinConfidence: {min_avg_conf_across_frames:.6f})")
+                 # --- Write correct confidence to CSV ---
+                 row_data = [video_timestamp_str, actual_processed_frame_num, base_filename, roi_id, result_data['text'], result_data['raw_text'], f"{conf_winning_frame:.6f}"]
+                 try: csv_writer.writerow(row_data)
+                 except Exception as csv_e: print(f"Error writing to CSV file: {csv_e}")
+        else:
+             print("    No results to write for the selected frame.")
 
-                    # --- FIX: Always print result for sampled frame ---
-                    print(f"    > ROI ID {roi_id}: Text = '{recognized_text_processed}' (Raw: '{recognized_text_raw}') (Transform: {roi_transform})")
 
-                except Exception as e: print(f"\nError processing ROI ID {roi_id}: {e}"); recognized_text_processed = f'Error: {e}'
-                # Write result row to CSV
-                row_data = [video_timestamp_str, actual_processed_frame_num, base_filename, roi_id, recognized_text_processed]
-                try: csv_writer.writerow(row_data)
-                except Exception as csv_e: print(f"Error writing to CSV file: {csv_e}")
+        # --- Update last processed time ---
+        last_processed_time_sec = current_processed_time_sec
 
-            total_ocr_time += (time.time() - ocr_start_time)
-
-        # --- Display Sampled Frame (if enabled) ---
-        if display_enabled:
-            display_frame = current_frame.copy() # Use the frame we just processed
+        # --- Display Best Sampled Frame (if enabled) ---
+        if display_enabled and best_frame_object is not None:
+            display_frame = best_frame_object.copy() # Use the best frame
             # Draw ROIs
             for i, roi_info in enumerate(rois):
                 color_tuple, color_name = ROI_COLORS[i % len(ROI_COLORS)]
                 try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=2); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
                 except Exception as draw_e: print(f"W: Could not draw ROI ID {roi_info['id']}: {draw_e}")
-            # Draw points being defined (shouldn't happen here)
-            if defining_roi: pass
-            # Draw PAUSED text (shouldn't happen here)
-            if paused: pass
             cv2.imshow(window_name, display_frame)
 
 
@@ -622,8 +796,10 @@ if __name__ == "__main__":
     parser.add_argument("input_paths", nargs='+', help="Path(s) to video file(s), directory, or glob pattern (e.g., 'videos/*.avi').")
     parser.add_argument("-o", "--output-csv", default="ocr_results.csv", help="Path for the output CSV file (defaults to 'ocr_results.csv').")
     parser.add_argument("-i", "--interval", type=float, default=1.0, dest='sample_interval_sec', help="Seconds between OCR attempts (defaults to 1.0).")
+    parser.add_argument("--gpu-id", type=int, default=0, help="ID of the GPU to use (default: 0). Ignored if --force-cpu is used.")
     parser.add_argument("--no-display", action="store_true", help="Disable the GUI display window.")
     parser.add_argument("--force-cpu", action="store_true", help="Force PaddleOCR to use CPU even if GPU is available.")
+    parser.add_argument("--threshold", action="store_true", dest="apply_thresholding", help="Apply Otsu's thresholding after contrast enhancement.") # New arg
 
     args = parser.parse_args()
 
@@ -635,6 +811,7 @@ if __name__ == "__main__":
     # Update global flags based on args
     ENABLE_DISPLAY = not args.no_display
     FORCE_CPU = args.force_cpu
+    APPLY_THRESHOLDING = args.apply_thresholding # Set global flag
 
     # --- Find Video Files ---
     video_files = []
@@ -667,16 +844,43 @@ if __name__ == "__main__":
     print(f"Sample Interval:    {args.sample_interval_sec} seconds")
     print(f"Display Enabled:    {ENABLE_DISPLAY}")
     print(f"Force CPU:          {FORCE_CPU}")
+    if not FORCE_CPU:
+        print(f"Target GPU ID:      {args.gpu_id}")
+    print(f"Apply Thresholding: {APPLY_THRESHOLDING}") # Print new flag status
     print(f"Found {len(video_files)} video file(s) to process:")
     for f in video_files: print(f"  - {f}")
     print(f"--------------------\n")
 
+    # --- Print GPU Info ---
+    if not FORCE_CPU:
+        try:
+            if paddle.is_compiled_with_cuda():
+                device_count = paddle.device.cuda.device_count()
+                print(f"Found {device_count} CUDA-enabled GPU(s):")
+                if device_count > 0:
+                    for i in range(device_count):
+                        print(f"  - GPU {i}: {paddle.device.cuda.get_device_name(i)}")
+                    if args.gpu_id >= device_count:
+                        print(f"Warning: Specified GPU ID {args.gpu_id} is out of range. Using GPU 0.")
+                        args.gpu_id = 0
+                else:
+                    print("  No GPUs found by PaddlePaddle. Will attempt CPU.")
+                    FORCE_CPU = True # Force CPU if no devices listed
+            else:
+                print("PaddlePaddle was not compiled with CUDA support. Using CPU.")
+                FORCE_CPU = True
+        except Exception as e:
+            print(f"Error getting GPU info: {e}. Using CPU.")
+            FORCE_CPU = True
+
 
     # --- Initialize PaddleOCR (once) ---
-    print("\nInitializing PaddleOCR (attempting GPU)...")
+    print("\nInitializing PaddleOCR...")
     try:
+        # Set GPU ID only if not forcing CPU
+        gpu_id_to_use = args.gpu_id if not FORCE_CPU else 0 # Default to 0 if forced CPU
         ocr_engine_main = paddleocr.PaddleOCR(
-            use_angle_cls=True, lang='en', use_gpu=(not FORCE_CPU), show_log=False,
+            use_angle_cls=True, lang='en', use_gpu=(not FORCE_CPU), gpu_id=gpu_id_to_use, show_log=False,
             det_db_unclip_ratio=PADDLE_UNCLIP_RATIO,
             det_db_thresh=PADDLE_DB_THRESH,
             det_db_box_thresh=PADDLE_BOX_THRESH
@@ -684,7 +888,7 @@ if __name__ == "__main__":
         print("PaddleOCR initialized.");
         print(f"  Using Params: UnclipRatio={PADDLE_UNCLIP_RATIO}, DBThresh={PADDLE_DB_THRESH}, BoxThresh={PADDLE_BOX_THRESH}")
         if FORCE_CPU: print("PaddleOCR running on CPU (forced).")
-        else: print("PaddleOCR attempting GPU.")
+        else: print(f"PaddleOCR attempting GPU {gpu_id_to_use}.")
     except Exception as e: print(f"Error initializing PaddleOCR: {e}"); sys.exit(1)
 
     # --- Load ROIs (once) ---
@@ -693,7 +897,8 @@ if __name__ == "__main__":
     elif not rois_loaded and not ENABLE_DISPLAY: print("Error: No ROI config found and display is disabled. Exiting."); sys.exit(1)
 
     # --- Setup CSV File (once) ---
-    csv_headers = ['Video Time', 'Frame', 'Filename', 'ROI ID', 'Recognized Text'] # Added Filename
+    # --- FIX: Add Raw Text and Confidence to headers ---
+    csv_headers = ['Video Time', 'Frame', 'Filename', 'ROI ID', 'Recognized Text', 'Raw Text', 'Confidence']
     file_exists = os.path.exists(args.output_csv)
     csvfile = None; csv_writer = None
     try:
