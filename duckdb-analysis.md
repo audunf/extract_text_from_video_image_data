@@ -74,25 +74,34 @@ ComparableMilliseconds AS (
       AND parsed_seconds IS NOT NULL
       AND parsed_centiseconds IS NOT NULL
 ),
--- Step 4: Calculate differences between pairs within the same Filename/Frame
+-- Step 4: Calculate differences between ROI 0 and ROIs 1, 2, 3, 4 within the same Filename/Frame
 Differences AS (
     SELECT
         t1."Filename",
         t1."Frame",
-        t1."ROI ID" AS ROI1,
-        t1."Recognized Text" AS Text1, -- Get Text for ROI1
+        t1."ROI ID" AS ROI1, -- This will always be 0
+        t1."Recognized Text" AS Text1, -- Get Text for ROI 0
         t1.comparable_total_ms AS Time1_ms,
-        t2."ROI ID" AS ROI2,
-        t2."Recognized Text" AS Text2, -- Get Text for ROI2
+        t2."ROI ID" AS ROI2, -- This will be 1, 2, 3, or 4
+        t2."Recognized Text" AS Text2, -- Get Text for ROI 1/2/3/4
         t2.comparable_total_ms AS Time2_ms,
         -- Calculate the absolute difference in milliseconds
         abs(t1.comparable_total_ms - t2.comparable_total_ms) AS diff_total_ms
     FROM ComparableMilliseconds t1
     JOIN ComparableMilliseconds t2 ON t1."Filename" = t2."Filename" AND t1."Frame" = t2."Frame"
-    -- Compare different ROI IDs only once
-    WHERE t1."ROI ID" < t2."ROI ID"
+    -- Ensure t1 is always ROI 0 and t2 is one of the target ROIs (1, 2, 3, 4)
+    WHERE t1."ROI ID" = 0 AND t2."ROI ID" IN (1, 2, 3, 4)
+),
+-- Step 5: Get the text for ROI ID 5 for relevant Filename/Frame combinations
+ROI5Text AS (
+    SELECT DISTINCT -- Use DISTINCT in case ROI 5 appears multiple times for the same frame
+        "Filename",
+        "Frame",
+        "Recognized Text" AS Text5
+    FROM ComparableMilliseconds
+    WHERE "ROI ID" = 5
 )
--- Step 5: Filter for differences > X and format the output
+-- Step 6: Filter differences >= 200ms, join with ROI 5 text, and format the output
 SELECT
     d."Filename",
     d."Frame",
@@ -100,6 +109,7 @@ SELECT
     d.Text1, -- Include original text for ROI1
     d.ROI2,
     d.Text2, -- Include original text for ROI2
+    r5.Text5, -- Include original text for ROI5 (will be NULL if ROI5 doesn't exist for this frame)
     d.diff_total_ms, -- Show the raw difference in milliseconds
     -- Correctly calculate minute, second, and millisecond components from the total ms difference
     -- 1. Calculate total whole seconds
@@ -117,13 +127,31 @@ SELECT
            diff_milliseconds -- This value is now guaranteed to be BIGINT
     ) AS formatted_difference
 FROM Differences d -- Alias the Differences CTE
--- Filter condition: difference must be greater than X milliseconds
+-- LEFT JOIN to include rows even if ROI 5 is missing for that frame
+LEFT JOIN ROI5Text r5 ON d."Filename" = r5."Filename" AND d."Frame" = r5."Frame"
+-- Filter condition: difference must be greater than or equal to 200 milliseconds
 WHERE d.diff_total_ms >= 200
 -- Order results for readability
 ORDER BY
     d."Filename" DESC,
     d."Frame" ASC,
     d.diff_total_ms DESC,
-    d.ROI1,
+    d.ROI1, -- ROI1 will always be 0 here
     d.ROI2;
+
 ```
+
+Late:
+│ sq48252.avi │  5241 │     0 │ 12:23:45.86 │     1 │ 14:23:45.62 │ FRONT_CAM_C22025-04-16 14:23:45.80  │           240 │                      0 │            0 │            0 │               240 │ 0min, 0sec, 240ms    │
+│ sq48252.avi │  5241 │     0 │ 12:23:45.86 │     2 │ 14:23:45.62 │ FRONT_CAM_C22025-04-16 14:23:45.80  │           240 │                      0 │            0 │            0 │               240 │ 0min, 0sec, 240ms    │
+│ sq48252.avi │  5241 │     0 │ 12:23:45.86 │     4 │ 14:23:45.65 │ FRONT_CAM_C22025-04-16 14:23:45.80  │           210 │                      0 │            0 │            0 │               210 │ 0min, 0sec, 210ms    │
+
+│ sq48456.avi │  6996 │     0 │ 03:37:37.99 │     1 │ 05:37:37.73 │ FRONT_CAM_C22025-04-22 05:37:37.82  │           260 │                      0 │            0 │            0 │               260 │ 0min, 0sec, 260ms    │
+│ sq48456.avi │  6996 │     0 │ 03:37:37.99 │     2 │ 05:37:37.76 │ FRONT_CAM_C22025-04-22 05:37:37.82  │           230 │                      0 │            0 │            0 │               230 │ 0min, 0sec, 230ms    │
+│ sq48456.avi │  6996 │     0 │ 03:37:37.99 │     4 │ 05:37:37.77 │ FRONT_CAM_C22025-04-22 05:37:37.82  │           220 │                      0 │            0 │            0 │               220 │ 0min, 0sec, 220ms    │
+│ sq48456.avi │  6996 │     0 │ 03:37:37.99 │     3 │ 05:37:37.79 │ FRONT_CAM_C22025-04-22 05:37:37.82  │           200 │                      0 │            0 │            0 │               200 │ 0min, 0sec, 200ms    │
+
+│ sq48456.avi │  8748 │     0 │ 03:38:48.08 │     2 │ 05:38:47.82 │ FRONT_CAM_C22025-04-22 05:38:47.89  │           260 │                      0 │            0 │            0 │               260 │ 0min, 0sec, 260ms    │
+│ sq48456.avi │  8748 │     0 │ 03:38:48.08 │     4 │ 05:38:47.83 │ FRONT_CAM_C22025-04-22 05:38:47.89  │           250 │                      0 │            0 │            0 │               250 │ 0min, 0sec, 250ms    │
+│ sq48456.avi │  8748 │     0 │ 03:38:48.08 │     1 │ 05:38:47.84 │ FRONT_CAM_C22025-04-22 05:38:47.89  │           240 │                      0 │            0 │            0 │               240 │ 0min, 0sec, 240ms    │
+│ sq48456.avi │  8748 │     0 │ 03:38:48.08 │     3 │ 05:38:47.86 │ FRONT_CAM_C22025-04-22 05:38:47.89  │           220 │                      0 │            0 │            0 │               220 │ 0min, 0sec, 220ms    │
