@@ -919,7 +919,8 @@ if __name__ == "__main__":
     # --- Process Each Video File ---
     overall_success = True
     try:
-        for video_file_path in video_files:
+        for index, video_file_path in enumerate(video_files):
+            print(f"\n--- Processing Video {index + 1}/{len(video_files)}: {video_file_path} ---")
             paused = False # Ensure each video starts unpaused
             success = process_video_file(
                 video_file_path,
