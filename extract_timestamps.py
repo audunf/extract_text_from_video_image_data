@@ -19,27 +19,27 @@ import argparse # For robust argument parsing
 # --- Configuration ---
 ROI_CONFIG_FILE = 'roi_config.json'
 ROI_TARGET_WIDTH = 300 # Target width for straightened patches
+DISPLAY_WIDTH = 2000
+
+TIMESTAMP_CHAR_WHITELIST = " 0123456789: ._-" # Added space and hyphen for date formats
+
 # --- >>> GUI Toggle <<< ---
 # ENABLE_DISPLAY = True # Controlled by command-line arg now
 # --- >>> CPU/GPU Toggle <<< ---
 # FORCE_CPU = False # Controlled by command-line arg now
-# --- >>> Preprocessing Flags (Applied BEFORE ROI Warp) <<< ---
-ROTATE_FRAME_90_CW = False
-ROTATE_FRAME_90_CCW = False
-ROTATE_FRAME_180 = False
-FLIP_HORIZONTAL = False
+
 # --- >>> ROI Enhancement Flags (Applied AFTER ROI Warp/Transform) <<< ---
 APPLY_GRAYSCALE = True
 ENHANCE_CONTRAST = True
-CLAHE_CLIP_LIMIT = 2.0
-CLAHE_TILE_GRID_SIZE = (8, 8)
+CLAHE_CLIP_LIMIT = 1.8
+CLAHE_TILE_GRID_SIZE = (4, 4)
 APPLY_THRESHOLDING = False # Optional: Apply Otsu's thresholding after CLAHE
 # --- >>> PaddleOCR Tuning Parameters <<< ---
 PADDLE_UNCLIP_RATIO = 2.0
 PADDLE_BOX_THRESH = 0.6
 PADDLE_DB_THRESH = 0.3
 # --- >>> Optimization Parameters <<< ---
-NORMAL_ORIENTATION_CONF_THRESHOLD = 0.85
+NORMAL_ORIENTATION_CONF_THRESHOLD = 0.90
 # --- >>> Best-of-3 Sampling Parameters <<< ---
 CHECK_ADJACENT_CONF_THRESHOLD = 1.1 # Currently not used in ROI-Win logic
 
@@ -232,9 +232,14 @@ def enhance_roi_patch(patch):
 def post_process_text(text):
     """Applies simple regex fixes to common OCR spacing/punctuation issues."""
     if not text: return ""
+    # 1. Filter out any characters not in our whitelist
+    filtered_chars = [char for char in text.upper() if char in TIMESTAMP_CHAR_WHITELIST]
+    filtered_text = "".join(filtered_chars)
+
     text = re.sub(r'(\d{4}-\d{2}-\d{2})(\d{2}:\d{2})', r'\1 \2', text) # DateTime space
     text = re.sub(r'(\d+\.)(\d{4}-)', r'\1 \2', text) # PrefixNumber Date space
     text = re.sub(r'\b(\d{2}:\d{2}:\d{2})(\d{2})\b', r'\1.\2', text) # SSms -> SS.ms
+    text = re.sub(r'(\d{2}):?(\d{2}):?(\d{2})\.?(\d{2})$', r'\1:\2:\3.\4', text) # 0828:0390 or 08:281880 or 08290269
     return text
 
 def optimize_roi_transform(roi_index, frame, ocr_engine):
@@ -310,19 +315,20 @@ def mouse_callback(event, x, y, flags, param):
     global current_roi_points, defining_roi, rois, next_roi_id, frame_for_opt
     if not defining_roi: return
     if event == cv2.EVENT_LBUTTONDOWN:
-        if x < 0:
-            x = 0
-        if y < 0:
-            y = 0
+        # Unpack params
+        ocr_engine, current_frame_for_opt, scale_x, scale_y = param
+        # Scale click coordinates back to original frame size
+        original_x = int(x / scale_x)
+        original_y = int(y / scale_y)
+
         if len(current_roi_points) < 4:
-            current_roi_points.append([x, y])
-            print(f"ROI point {len(current_roi_points)} added: ({x}, {y})")
+            current_roi_points.append([original_x, original_y])
+            print(f"ROI point {len(current_roi_points)} added: ({original_x}, {original_y})")
             if len(current_roi_points) == 4:
                 new_roi = {'id': next_roi_id, 'points': current_roi_points.copy(), 'transform': {'rotate': 0, 'flip_code': None}}
                 rois.append(new_roi); new_roi_index = len(rois) - 1
                 print(f"ROI #{next_roi_id} defined. Optimizing transform...")
                 current_roi_id = next_roi_id; next_roi_id += 1
-                ocr_engine, current_frame_for_opt = param
                 if current_frame_for_opt is not None: optimize_roi_transform(new_roi_index, current_frame_for_opt, ocr_engine)
                 else: print("Warning: Cannot optimize ROI immediately, no frame available.")
                 current_roi_points = []; defining_roi = False
@@ -385,6 +391,7 @@ def process_single_frame_ocr(frame, frame_idx, ocr_engine):
             recognized_text_raw = "ERROR" # Ensure raw text reflects error too
             avg_conf_this_roi = 0.0 # Assign 0 confidence on error
             min_conf_this_roi = 0.0
+            raise
 
         # Store detailed results for this ROI
         frame_results[roi_id] = {
@@ -422,8 +429,10 @@ def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1
         return False
 
     # --- Get Video Properties ---
-    fps = cap.get(cv2.CAP_PROP_FPS); total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS);
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH));
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_duration_sec = (total_frames / fps) if fps and fps > 0 else 0
 
     # --- FPS Check ---
@@ -450,8 +459,15 @@ def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1
     window_name = f"ROI Definition & OCR Output - {base_filename}"
     if display_enabled:
         cv2.namedWindow(window_name)
+
+        scale_x = DISPLAY_WIDTH / frame_width
+        scale_y = (DISPLAY_WIDTH / frame_width) * (frame_height / frame_width) # Should be scale_x * (h/w) / (h/w) = scale_x
+        # To be precise, calculate display height first
+        display_height = int(frame_height * (DISPLAY_WIDTH / frame_width))
+        scale_y = display_height / frame_height
+
         frame_ref = [first_frame]
-        cv2.setMouseCallback(window_name, mouse_callback, param=(ocr_engine, frame_ref))
+        cv2.setMouseCallback(window_name, mouse_callback, param=(ocr_engine, frame_ref, scale_x, scale_y))
         print("\n  --- Controls ---")
         print("   Mouse Click: Define ROI corners (after pressing 'n')")
         print("    n: Start NEW ROI | d: DELETE last | c: CLEAR all")
@@ -478,16 +494,20 @@ def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1
                 # Draw ROIs, points being defined, PAUSED text etc.
                 for i, roi_info in enumerate(rois):
                     color_tuple, color_name = ROI_COLORS[i % len(ROI_COLORS)]
-                    try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=2); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
+                    try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=1); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
                     except Exception as draw_e: print(f"W: Could not draw ROI ID {roi_info['id']}: {draw_e}")
                 if defining_roi:
-                    for idx, pt in enumerate(current_roi_points): cv2.circle(display_frame, tuple(pt), 5, (0, 255, 255), -1); cv2.putText(display_frame, str(idx+1), (pt[0]+5, pt[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+                    for idx, pt in enumerate(current_roi_points): cv2.circle(display_frame, tuple(pt), 2, (0, 255, 255), -1); cv2.putText(display_frame, str(idx+1), (pt[0]+5, pt[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
                     prompt_y_pos = 30; prompt_text = "";
                     if len(current_roi_points) < 4: prompt_text = f"Click point {len(current_roi_points)+1}/4 for ROI ID {next_roi_id}"
                     if prompt_text: cv2.putText(display_frame, prompt_text, (10, prompt_y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.putText(display_frame, "PAUSED", (frame_width - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 if show_warped: cv2.putText(display_frame, "Showing Warped Patches ('v' pressed)", (frame_width - 350, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.imshow(window_name, display_frame)
+
+                # Resize before showing
+                resized_display = cv2.resize(display_frame, (DISPLAY_WIDTH, int(frame_height * (DISPLAY_WIDTH / frame_width))), interpolation=cv2.INTER_AREA)
+                cv2.imshow(window_name, resized_display)
 
                 # Show warped patches if requested ('v' key while paused)
                 if show_warped and rois:
@@ -711,13 +731,20 @@ def process_video_file(video_path, csv_writer, ocr_engine, sample_interval_sec=1
 
         # --- Display Best Sampled Frame (if enabled) ---
         if display_enabled and best_frame_object is not None:
-            display_frame = best_frame_object.copy() # Use the best frame
-            # Draw ROIs
+            # Resize for display
+            resized_display = cv2.resize(best_frame_object, (DISPLAY_WIDTH, int(frame_height * (DISPLAY_WIDTH / frame_width))), interpolation=cv2.INTER_AREA)
+            # Draw ROIs on the *resized* frame for accurate visualization
+            display_with_rois = resized_display.copy()
+            scale_x = DISPLAY_WIDTH / frame_width
             for i, roi_info in enumerate(rois):
                 color_tuple, color_name = ROI_COLORS[i % len(ROI_COLORS)]
-                try: points = np.array(roi_info['points'], dtype=np.int32).reshape((-1, 1, 2)); cv2.polylines(display_frame, [points], isClosed=True, color=color_tuple, thickness=2); cv2.putText(display_frame, str(roi_info['id']), tuple(points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_tuple, 2)
+                try:
+                    # Scale points for drawing on resized image
+                    scaled_points = (np.array(roi_info['points']) * scale_x).astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(display_with_rois, [scaled_points], isClosed=True, color=color_tuple, thickness=1)
+                    cv2.putText(display_with_rois, str(roi_info['id']), tuple(scaled_points[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_tuple, 1)
                 except Exception as draw_e: print(f"W: Could not draw ROI ID {roi_info['id']}: {draw_e}")
-            cv2.imshow(window_name, display_frame)
+            cv2.imshow(window_name, display_with_rois)
 
 
         # --- Handle Key Press (if display enabled) ---
@@ -884,6 +911,7 @@ if __name__ == "__main__":
             det_db_unclip_ratio=PADDLE_UNCLIP_RATIO,
             det_db_thresh=PADDLE_DB_THRESH,
             det_db_box_thresh=PADDLE_BOX_THRESH
+            # enable_hpi=True,  # Enable HPI for better performance
         )
         print("PaddleOCR initialized.");
         print(f"  Using Params: UnclipRatio={PADDLE_UNCLIP_RATIO}, DBThresh={PADDLE_DB_THRESH}, BoxThresh={PADDLE_BOX_THRESH}")
